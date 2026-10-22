@@ -89,9 +89,19 @@ RUN addgroup -g 1001 -S app && adduser -u 1001 -S app -G app
 COPY --from=build --chown=app:app /app/apps/smtp/.next/standalone ./
 COPY --from=build --chown=app:app /app/apps/smtp/.next/static ./apps/smtp/.next/static
 COPY --from=build --chown=app:app /app/apps/smtp/public ./apps/smtp/public
-# FileAPL writes the Saleor auth token here; mount a volume so a restart does
-# not lose the installation.
-RUN mkdir -p /app/.apl && chown -R app:app /app/.apl
+# The Saleor auth token lives at FILE_APL_PATH. The directory is created here,
+# OWNED BY THE RUNTIME USER, and it must be: a named volume mounted over it
+# inherits this directory's ownership when it is first created, and the app
+# runs as uid 1001. If the mountpoint were root-owned the app could read the
+# token but not rewrite it, and the next install would fail with "File APL was
+# unable to save auth data".
+#
+# The image must carry the path the deployment uses (infra/env/smtp-app.env
+# sets FILE_APL_PATH=/app/data/auth.json) — the app's FileAPL is patched to
+# honour it; upstream's ignores it and always writes
+# ".saleor-app-auth.json" into the working directory, which is the container's
+# writable layer and loses the installation on every container replacement.
+RUN mkdir -p /app/data && chown -R app:app /app/data
 USER app
 EXPOSE 3005
 # The app has no /api/health route; /api/manifest is its unauthenticated
