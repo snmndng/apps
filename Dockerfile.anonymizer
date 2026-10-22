@@ -1,0 +1,117 @@
+# Production image for saleor/apps/apps/anonymizer (Saleor Anonymizer app).
+#
+# Built from the upstream saleor/apps monorepo (https://github.com/saleor/apps).
+# The upstream repo ships devcontainer Dockerfiles only; this is the production
+# image the LuxiorMall platform pins in infra/platform-version.yml.
+#
+# Build (from the repo root):
+#   docker build -f Dockerfile.anonymizer -t ghcr.io/snmndng/saleor-app-anonymizer:1.2.13 .
+#
+# Runtime contract mirrors the app's own .env.example. This app has no APL and
+# no datastore — it authenticates with the Dashboard's own token (NoopAPL), so
+# there is no volume and no auth token to lose.
+
+# ─── deps + build ───────────────────────────────────────────────────────────
+FROM node:24-alpine AS build
+ENV PNPM_HOME=/pnpm
+ENV PATH=$PNPM_HOME:$PATH
+ENV NEXT_TELEMETRY_DISABLED=1
+ENV NODE_OPTIONS=--max-old-space-size=3072
+ENV ENV=production
+# The app validates its environment when it is imported, and Next.js imports it
+# during the build. This app's schema does NOT declare SECRET_KEY (it has no
+# metadata to encrypt — it acts with the Dashboard user's own token, NoopAPL),
+# so the placeholder below is belt-and-braces rather than load-bearing: it
+# exists so this Dockerfile stays a one-line difference from Dockerfile.smtp if
+# upstream ever adds the variable to this app's schema too. It is a build-time
+# placeholder only and is never the production secret.
+ENV SECRET_KEY=build-time-placeholder-not-used-at-runtime
+ENV SENTRY_SUPPRESS_GLOBAL_ERROR_HANDLER_FILE_WARNING=1
+# NEXT_PUBLIC_CUSTOMER_SCRAMBLE_DOMAIN is a CLIENT variable: it is read by
+# React components (gdpr-removal-view.tsx, bulk-anonymize-section.tsx), and
+# Next.js INLINES process.env.NEXT_PUBLIC_* into the client bundle at build
+# time. A runtime value in env/anonymizer-app.env therefore has NO effect on
+# the browser — the app falls back to the schema default, "example.com", and
+# every erased customer gets <uuid>@example.com as their replacement address.
+#
+# It is not a secret, so baking it is correct. The default must match
+# env/anonymizer-app.env; override with --build-arg to change it, and
+# rebuild — there is no runtime override for a NEXT_PUBLIC_ variable.
+ARG NEXT_PUBLIC_CUSTOMER_SCRAMBLE_DOMAIN=anonymized.luxiormall.com
+ENV NEXT_PUBLIC_CUSTOMER_SCRAMBLE_DOMAIN=${NEXT_PUBLIC_CUSTOMER_SCRAMBLE_DOMAIN}
+RUN corepack enable && corepack prepare pnpm@10.28.1 --activate
+WORKDIR /app
+
+# The whole workspace is copied so the pnpm workspace importers match
+# pnpm-lock.yaml exactly; --frozen-lockfile fails otherwise. Only the app and
+# its dependency packages are actually installed and built.
+COPY . .
+RUN --mount=type=cache,id=pnpm-store,target=/pnpm/store \
+    pnpm install --frozen-lockfile --filter saleor-app-anonymizer...
+# Upstream does not set `output: "standalone"`; add it for a self-contained image.
+RUN sed -i 's/^const nextConfig: NextConfig = {$/const nextConfig: NextConfig = {\n  output: "standalone",/' apps/anonymizer/next.config.ts \
+    && grep -q 'output: "standalone"' apps/anonymizer/next.config.ts
+# `--env-mode=loose` is REQUIRED, not a preference. turbo.json declares a
+# strict `globalEnv` allowlist that does not include SECRET_KEY, and Turborepo's
+# default strict mode STRIPS every env var that is not on that list before the
+# task runs. Without this flag the build dies at "Collecting page data" with
+# `Validation error: Required at "SECRET_KEY"` — the app's zod schema requires
+# it, the compiler does not, and only the page-data worker imports the schema.
+RUN pnpm turbo run build --filter=saleor-app-anonymizer --env-mode=loose
+# Standalone output for a pnpm monorepo keeps the workspace-relative layout,
+# so the server entry is nested under apps/anonymizer/.
+RUN test -f apps/anonymizer/.next/standalone/apps/anonymizer/server.js
+# The build-time SECRET_KEY placeholder must NOT have been inlined into the
+# server bundle. Server-side `process.env.SECRET_KEY` is resolved at runtime,
+# so the real key comes from the container's environment — but if a future
+# Next.js release inlines it, the image would ship with a known key and the
+# app would encrypt Saleor's app metadata with it. Fail the build instead.
+#
+# The exit code is checked explicitly: grep returns 1 for "not found" (good),
+# 0 for "found" (fatal) and 2+ for "could not scan" (also fatal). A plain
+# `! grep ...` would pass on 2+ as well, and Alpine's busybox grep has no
+# --include, so a filtered variant is not available either.
+RUN set -e; \
+    if grep -rq "build-time-placeholder-not-used-at-runtime" apps/anonymizer/.next/standalone; then \
+      echo "FATAL: the build-time SECRET_KEY placeholder was inlined into the server bundle"; \
+      exit 1; \
+    else \
+      code=$?; \
+      if [ "$code" -ne 1 ]; then \
+        echo "FATAL: could not scan the bundle for the placeholder (grep exit $code)"; \
+        exit 1; \
+      fi; \
+    fi
+# The scramble domain really is in the client bundle. If this ever fails, the
+# build arg above was not applied and the app would silently erase customers
+# to <uuid>@example.com.
+RUN grep -rqs "anonymized.luxiormall.com" apps/anonymizer/.next/static \
+    || grep -rqs "anonymized.luxiormall.com" apps/anonymizer/.next/standalone
+
+# ─── runtime ────────────────────────────────────────────────────────────────
+FROM node:24-alpine AS runtime
+ENV NODE_ENV=production
+ENV NEXT_TELEMETRY_DISABLED=1
+# The port the app listens on INSIDE the container. It must match the port
+# cloudflared proxies to (`http://anonymizer-app:3006` in
+# infra/cloudflared/config.yml) and the healthcheck below. Nothing publishes
+# this port on the host — the tunnel is the only way in.
+ENV PORT=3006
+# Next.js standalone binds to $HOSTNAME. Docker sets that to the container id
+# by default, so the server would listen on eth0 only and the container's own
+# healthcheck would get ECONNREFUSED on loopback forever. (paystack-gateway
+# image 0.1.0 had exactly this bug and reported `unhealthy` for its life.)
+ENV HOSTNAME=0.0.0.0
+WORKDIR /app
+RUN addgroup -g 1001 -S app && adduser -u 1001 -S app -G app
+COPY --from=build --chown=app:app /app/apps/anonymizer/.next/standalone ./
+COPY --from=build --chown=app:app /app/apps/anonymizer/.next/static ./apps/anonymizer/.next/static
+COPY --from=build --chown=app:app /app/apps/anonymizer/public ./apps/anonymizer/public
+USER app
+EXPOSE 3006
+# The app has no /api/health route; /api/manifest is its unauthenticated
+# liveness endpoint and is what Saleor itself polls. The port is read from
+# the environment rather than hardcoded, so it cannot drift from $PORT.
+HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
+  CMD node -e "fetch('http://127.0.0.1:'+(process.env.PORT||3000)+'/api/manifest').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"
+CMD ["node", "apps/anonymizer/server.js"]

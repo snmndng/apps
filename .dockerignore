@@ -1,0 +1,16 @@
+node_modules
+**/node_modules
+.git
+.github
+.next
+.turbo
+dist
+coverage
+*.log
+.DS_Store
+
+# graft's local code graph. It is regenerable (`graft build`) and it is
+# thousands of files — copying it into the build context costs real time and
+# changes the context hash on every graph rebuild, which would invalidate the
+# image layer cache for no reason.
+graft/
