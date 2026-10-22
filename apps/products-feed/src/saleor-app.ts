@@ -41,7 +41,17 @@ switch (aplType) {
     break;
 
   case "file":
-    apl = new FileAPL();
+    // Upstream's FileAPL takes no path from the environment: with no
+    // argument it always writes ".saleor-app-auth.json" into the process's
+    // working directory. Next.js standalone chdirs into the app directory,
+    // so the Saleor auth token lands in the container's writable layer and a
+    // container replacement silently loses the installation — the feed route
+    // then answers 400 with "The given instance has not been registered".
+    //
+    // Passing the path through makes FILE_APL_PATH mean what the env file
+    // says it means, and lets the token live on a mounted volume. The
+    // directory the file lands in must be writable by the runtime user.
+    apl = new FileAPL({ fileName: env.FILE_APL_PATH || ".saleor-app-auth.json" });
 
     break;
 
